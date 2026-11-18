@@ -17,12 +17,16 @@ using Base.ScopedValues: ScopedValue, @with
 const PgConnection = Postgres.Connection{Postgres.Statement{Postgres.PostgresStyle}, Postgres.PostgresStyle}
 const PgStatement = Postgres.Statement{Postgres.PostgresStyle}
 
-"The SQLSTATE code of a PostgreSQL error, such as `\"23505\"`, or `nothing` for other errors."
-sqlstate(err)::Union{String,Nothing} = err isa Postgres.Error ? err.code : nothing
+"""
+The SQLSTATE code of a PostgreSQL error, such as `\"23505\"`, or `nothing` for other errors.
+Looks through a [`StatementNotRun`](@ref) to the error it wraps.
+"""
+sqlstate(err)::Union{String,Nothing} = (e = _pg_cause(err)) isa Postgres.Error ? e.code : nothing
 
-"The constraint a PostgreSQL error names, or `nothing`."
-constraint_name(err)::Union{String,Nothing} =
-    err isa Postgres.Error ? err.constraint : nothing
+"The constraint a PostgreSQL error names, or `nothing`. Looks through a [`StatementNotRun`](@ref)."
+constraint_name(err)::Union{String,Nothing} = (e = _pg_cause(err)) isa Postgres.Error ? e.constraint : nothing
+
+_pg_cause(err) = err isa StatementNotRun ? err.cause : err
 
 "A bounded pool of connections to one database, made by [`with_db_pool`](@ref)."
 mutable struct DBPool
@@ -111,6 +115,9 @@ function with_db_pool(f, host::String, user::String, password::String, dbname::S
                       application_name::String = "ScopedPostgres", statement_cache_maxsize::Int = 1024,
                       prefer_ipv4::Bool = false, time_zone::Union{String,Nothing} = "UTC",
                       timestamps_as_text::Bool = false)
+    # The block's queries would otherwise run on the outer pool's connection.
+    isassigned(DB_CONNECTION) && throw(ArgumentError(
+        "with_db_pool cannot open inside a with_db_connection or transaction block"))
     limit > 0 || throw(ArgumentError("limit must be a positive integer, got $limit"))
     idle_evict_seconds >= 0 ||
         throw(ArgumentError("idle_evict_seconds must be a non-negative number, got $idle_evict_seconds"))
@@ -262,7 +269,8 @@ function _connection_ready(pool::DBPool, conn::PgConnection)
         get(pool.connection_generations, conn, -1) == pool.schema_generation
     end || return false
     return try
-        !conn.in_transaction
+        # The server's flag also catches a transaction a raw `BEGIN` opened.
+        !conn.in_transaction && !conn.server_in_transaction
     catch
         false
     end
@@ -411,7 +419,7 @@ function _reusable_after_error(conn::PgConnection, @nospecialize(e))
     (_is_connection_error(cause) || _is_stale_session_error(cause)) && return false
     _is_result_decode_error(cause) && return false
     return try
-        isopen(conn) && !conn.in_transaction
+        isopen(conn) && !conn.in_transaction && !conn.server_in_transaction
     catch
         false
     end
@@ -715,7 +723,9 @@ _is_connection_error_message(message::String) =
     message = _error_message(e)
     cached_plan_shape_changed = e isa Postgres.API.Error && e.code == "0A000" &&
         occursin("cached plan must not change result type", message)
-    return cached_plan_shape_changed ||
+    # 26000: the session no longer has the prepared statement.
+    statement_missing = e isa Postgres.API.Error && e.code == "26000"
+    return cached_plan_shape_changed || statement_missing ||
            occursin("unexpected message type: E", message) ||
            occursin("bind message supplies", message) ||
            occursin("prepared statement does not exist", message) ||
@@ -838,6 +848,7 @@ end
 @noinline function _normalize_params(@nospecialize(params))::Union{Nothing, Vector{Union{String, Missing}}}
     params === nothing && return nothing
     params isa Vector{Union{String, Missing}} && return params
+    params isa Tuple{} && return Union{String, Missing}[]
     if params isa NTuple{1, Any}
         out = Vector{Union{String, Missing}}(undef, 1)
         out[1] = _param_narrowed(params[1])
@@ -1301,8 +1312,9 @@ end
 """
     query(T, sql, params = nothing) -> Union{T, Nothing}
 
-Run `sql` with `params` (a tuple, up to 26 values, or a `Vector{Any}`) and decode the
-first row as a `T`, or return `nothing` when there are no rows. `\$1`, `\$2`, ... in `sql`
+Run `sql` with `params` (a tuple, up to 26 values, or a `Vector{Any}`) and decode its
+row as a `T`, or return `nothing` when there are no rows. More than one row throws an
+`ArgumentError`; use [`queryall`](@ref) for those. `\$1`, `\$2`, ... in `sql`
 are the parameters. `nothing` and `missing` parameters are SQL NULL.
 """
 function query(::Type{T}, sql::String, @nospecialize(params=nothing)) where {T}

@@ -14,6 +14,8 @@ const conn_failure = _pg_error("08006", "connection failure")
 const unique_violation = _pg_error("23505", "duplicate key value violates unique constraint")
 const stale_row_shape = _pg_error("0A000", "cached plan must not change result type")
 
+@testset "ScopedPostgres" begin
+
 @testset "query parameters" begin
     @test SP._normalize_params((Date(2026, 7, 19),)) == ["2026-07-19"]
     @test SP._normalize_params((DateTime(2026, 7, 19, 12, 34, 56),)) == ["2026-07-19T12:34:56"]
@@ -22,6 +24,7 @@ const stale_row_shape = _pg_error("0A000", "cached plan must not change result t
     @test isequal(SP._normalize_params((nothing, missing, true)), [missing, missing, "true"])
     @test SP._normalize_params(ntuple(identity, 26)) == string.(1:26)
     @test SP._normalize_params(Any["a", 1]) == ["a", "1"]
+    @test SP._normalize_params(()) == Union{String,Missing}[]
     @test_throws ArgumentError SP._normalize_params((:symbol,))
     @test_throws ArgumentError SP._normalize_params(ntuple(identity, 27))
 end
@@ -98,6 +101,8 @@ end
         @test !SP._should_retry(conn_timeout, "UPDATE registrations SET status = 'confirmed'")
         # The session lost its statements: the statement never ran.
         @test SP._should_retry(stale_stmt, "INSERT INTO t VALUES (1)")
+        # What PostgreSQL actually reports for a statement the session no longer has.
+        @test SP._should_retry(_pg_error("26000", "prepared statement \"s3\" does not exist"), "INSERT INTO t VALUES (1)")
         @test SP._should_retry(stale_row_shape, "UPDATE events SET name = 'new'")
         @test !SP._should_retry(_pg_error("0A000", "feature not supported"), "SELECT 1")
         @test SP._should_retry(backend_killed, "SELECT * FROM users")
@@ -133,6 +138,8 @@ end
     @test occursin("Connection reset by peer", sprint(showerror, SP.StatementNotRun(conn_reset)))
     @test SP.sqlstate(unique_violation) == "23505"
     @test SP.sqlstate(ErrorException("x")) === nothing
+    # An error raised while preparing reaches callers wrapped in StatementNotRun.
+    @test SP.sqlstate(SP.StatementNotRun(_pg_error("42P01", "relation \"nope\" does not exist"))) == "42P01"
 end
 
 @testset "spawned reads" begin
@@ -207,6 +214,40 @@ else
                 @test SP.constraint_name(err) == "scopedpostgres_items_pkey"
             end
 
+            @testset "one row or none" begin
+                @test_throws ArgumentError SP.query(@NamedTuple{n::Int}, "SELECT n FROM generate_series(1, 2) n")
+                err = try
+                    SP.query(@NamedTuple{n::Int}, "SELECT n FROM scopedpostgres_missing")
+                catch e
+                    e
+                end
+                @test SP.sqlstate(err) == "42P01"
+            end
+
+            @testset "a connection left inside a transaction is not lent out again" begin
+                stray_pid = SP.with_db_connection() do
+                    DBInterface.execute(SP.current_connection(), "BEGIN")
+                    SP.query(@NamedTuple{pid::Int}, "SELECT pg_backend_pid() AS pid").pid
+                end
+                SP.transaction() do
+                    @test SP.query(@NamedTuple{pid::Int}, "SELECT pg_backend_pid() AS pid").pid != stray_pid
+                    SP.execute("INSERT INTO scopedpostgres_items (id, name) VALUES ('t', 'Tango')")
+                end
+                seen = SP.with_db_connection(; forcenew = true) do
+                    SP.query(Item, "SELECT id, name, size FROM scopedpostgres_items WHERE id = 't'")
+                end
+                @test seen == (id = "t", name = "Tango", size = nothing)
+            end
+
+            @testset "a statement the session lost is prepared again" begin
+                SP.with_db_connection() do
+                    @test SP.query(@NamedTuple{n::Int}, "SELECT 7 AS n").n == 7
+                    SP.execute("DEALLOCATE ALL")
+                end
+                # The pool hands back the same session; its cached statement is gone.
+                @test SP.query(@NamedTuple{n::Int}, "SELECT 7 AS n").n == 7
+            end
+
             @testset "snapshots and one session" begin
                 @test SP.read_snapshot() do
                     SP.query(@NamedTuple{level::String}, "SELECT current_setting('transaction_isolation') AS level").level
@@ -244,6 +285,19 @@ else
                 "scopedpostgres-test"
         end
 
+        @testset "a pool cannot open inside another pool's connection" begin
+            with_test_pool() do
+                SP.with_db_connection() do
+                    @test_throws ArgumentError with_test_pool(() -> SP.query(@NamedTuple{n::Int}, "SELECT 1 AS n"))
+                end
+                SP.transaction() do
+                    @test_throws ArgumentError with_test_pool(() -> nothing)
+                end
+                # Outside a connection block, an inner pool is fine and uses its own connections.
+                @test with_test_pool(() -> SP.pool_stats().in_use) == 0
+            end
+        end
+
         @testset "a migration retires the pool's sessions" begin
             with_test_pool() do
                 first_pid = SP.query(@NamedTuple{pid::Int}, "SELECT pg_backend_pid() AS pid").pid
@@ -252,4 +306,6 @@ else
             end
         end
     end
+end
+
 end
