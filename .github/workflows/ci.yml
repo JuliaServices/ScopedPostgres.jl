@@ -1,0 +1,101 @@
+name: CI
+on:
+  push:
+    branches: [main]
+    tags: ["*"]
+  pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      actions: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['1.12', '1.13']
+        os: [ubuntu-latest, windows-latest, macOS-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
+  database:
+    # Service containers run only on Linux, so the tests that need a database run here.
+    name: Julia ${{ matrix.version }} - PostgreSQL ${{ matrix.postgres }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['1.12', '1.13']
+        postgres: ['14', '17']
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      PGHOST: localhost
+      PGPORT: '5432'
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
+  trim:
+    name: juliac --trim
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          # Trust sign-in: the trimmed binary skips SCRAM, whose Base64 calls stock Julia cannot trim.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          # Julia 1.13 cannot trim a ScopedValues update; 1.14 can (JuliaLang/julia#62730).
+          version: '1.14'
+          include-all-prereleases: true
+      - uses: julia-actions/cache@v2
+      - name: Compile test/trim/main.jl
+        # `--trim=safe` stops on the Base64 and Dates errors in Postgres.jl's dependencies
+        # (see test/trim/check_errors.jl), so build with warnings and check that every
+        # verifier error is one of those.
+        run: |
+          set -o pipefail
+          julia --project=test/trim -e 'using Pkg; Pkg.instantiate()'
+          julia --project=@juliac -e 'using Pkg; Pkg.add("JuliaC")'
+          julia --project=@juliac -e 'using JuliaC; JuliaC.main(["--output-exe", "scopedpostgrestrim", "--bundle", "build", "--project", "test/trim", "--trim=unsafe-warn", "--experimental", "test/trim/main.jl"])' 2>&1 | tee build.log
+          julia test/trim/check_errors.jl build.log
+      - name: Run it against PostgreSQL
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGDATABASE: postgres
+        run: ./build/bin/scopedpostgrestrim

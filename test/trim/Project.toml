@@ -1,0 +1,5 @@
+[deps]
+ScopedPostgres = "4871ccb0-c492-4fdd-9f62-54b654ce8990"
+
+[sources]
+ScopedPostgres = {path = "../.."}
