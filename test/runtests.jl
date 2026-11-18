@@ -229,6 +229,17 @@ else
                     DBInterface.execute(SP.current_connection(), "BEGIN")
                     SP.query(@NamedTuple{pid::Int}, "SELECT pg_backend_pid() AS pid").pid
                 end
+                # It is closed rather than kept idle in its transaction, holding its locks.
+                # Look from a second pool, which leaves this pool's idle connections alone.
+                stray_session(pid) = with_test_pool() do
+                    SP.query(@NamedTuple{n::Int},
+                        "SELECT count(*)::int AS n FROM pg_stat_activity WHERE pid = \$1", (pid,)).n
+                end
+                for _ in 1:50
+                    stray_session(stray_pid) == 0 && break
+                    sleep(0.1)
+                end
+                @test stray_session(stray_pid) == 0
                 SP.transaction() do
                     @test SP.query(@NamedTuple{pid::Int}, "SELECT pg_backend_pid() AS pid").pid != stray_pid
                     SP.execute("INSERT INTO scopedpostgres_items (id, name) VALUES ('t', 'Tango')")

@@ -12,8 +12,10 @@ it, and give it back. No connection object is passed around.
   snapshots for reads that must agree with each other.
 - Safe retries: a statement that failed before it could have run (a dead pooled
   connection, a lost prepared statement) is retried once on a fresh connection. A
-  `SELECT` is also retried when the connection dies while it runs; a write is not, since
-  it may already have committed.
+  statement starting with `SELECT` is also retried when the connection dies while it
+  runs; a write is not, since it may already have committed. A `SELECT` with a side
+  effect (`nextval`, a function that writes) counts as a read, so run it inside
+  `transaction`, where nothing is retried.
 - Concurrent reads (`spawn_read`) that overlap their round trips without taking every
   connection.
 - A statement counter, for tests that pin how many queries a request makes.
@@ -50,9 +52,14 @@ ScopedPostgres.with_db_pool("localhost", "app", ENV["PGPASSWORD"], "appdb"; limi
 end
 ```
 
-Parameters are a tuple (up to 26 values) or a `Vector{Any}` of `String`, integers,
-`Float64`, `Bool`, `Date`, `DateTime`, bytes, `Vector`s of `String`, `Int`, or `Float64`,
-and `nothing` or `missing` for NULL.
+Parameters are a tuple (up to 26 values) or a `Vector{Any}` of `String`, `Int`,
+`Int32`, `Float64`, `Bool`, `Date`, `DateTime`, bytes (`Vector{UInt8}`), `Vector`s of
+`String`, `Int`, or `Float64`, and `nothing` or `missing` for NULL. Other types throw an
+`ArgumentError`.
+
+A task started inside `with_db_connection` or `transaction` inherits its connection;
+finish it before the block ends. `spawn_read` inside one of those blocks runs its read
+before returning for this reason.
 
 ## Pool settings
 

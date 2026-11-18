@@ -268,12 +268,14 @@ function _connection_ready(pool::DBPool, conn::PgConnection)
     _locked(pool) do
         get(pool.connection_generations, conn, -1) == pool.schema_generation
     end || return false
-    return try
-        # The server's flag also catches a transaction a raw `BEGIN` opened.
-        !conn.in_transaction && !conn.server_in_transaction
-    catch
-        false
-    end
+    return !_in_transaction(conn)
+end
+
+# The server's flag also catches a transaction a raw `BEGIN` opened.
+_in_transaction(conn::PgConnection) = try
+    conn.in_transaction || conn.server_in_transaction
+catch
+    true
 end
 
 # Reserve one of the bounded checkout slots and optionally take an idle client.
@@ -419,7 +421,7 @@ function _reusable_after_error(conn::PgConnection, @nospecialize(e))
     (_is_connection_error(cause) || _is_stale_session_error(cause)) && return false
     _is_result_decode_error(cause) && return false
     return try
-        isopen(conn) && !conn.in_transaction && !conn.server_in_transaction
+        isopen(conn) && !_in_transaction(conn)
     catch
         false
     end
@@ -430,6 +432,8 @@ end
 
 Run `f()` on one checked-out connection, so every statement inside it uses the same
 session. Nested calls reuse the outer connection. `forcenew = true` opens a fresh one.
+A task started inside the block inherits the connection: finish it before the block
+ends, or its statements run on a connection the pool has lent to someone else.
 """
 function with_db_connection(f::F; forcenew::Bool=false) where {F}
     isassigned(DB_CONNECTION) && return f()
@@ -438,6 +442,9 @@ function with_db_connection(f::F; forcenew::Bool=false) where {F}
     reusable = true
     try
         result = @with DB_CONNECTION => conn f()
+        # A transaction `f` opened with raw SQL and left open would keep its locks
+        # while the connection sat idle in the pool.
+        reusable = !_in_transaction(conn)
         return result
     catch e
         reusable = _reusable_after_error(conn, e)
@@ -554,6 +561,8 @@ in_transaction() = IN_TRANSACTION[]
 Run `f()` inside one database transaction on one connection: it commits when `f` returns
 and rolls back when `f` throws. A nested `transaction` joins the outer one. If the
 connection fails before the transaction begins, it is retried once on a fresh connection.
+Statements inside a transaction are never retried. A task started inside the block
+inherits the transaction's connection: finish it before the block ends.
 `mock = true` runs `f()` without a transaction.
 """
 function transaction(f::F; mock::Bool=false) where {F}
@@ -842,7 +851,7 @@ lpad4(x::Int)::String = x < 10 ? string("000", x) : x < 100 ? string("00", x) : 
     p isa Vector{String} && return Postgres._param(p)
     p isa Vector{Int} && return Postgres._param(p)
     p isa Vector{Float64} && return Postgres._param(p)
-    throw(ArgumentError("unsupported query parameter type: pass a String, number, Bool, Date, DateTime, bytes, or a Vector of String, Int, or Float64"))
+    throw(ArgumentError("unsupported query parameter type: pass a String, Int, Int32, Float64, Bool, Date, DateTime, Vector{UInt8}, or a Vector of String, Int, or Float64"))
 end
 
 @noinline function _normalize_params(@nospecialize(params))::Union{Nothing, Vector{Union{String, Missing}}}
