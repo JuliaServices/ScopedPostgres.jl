@@ -5,7 +5,18 @@ const SP = ScopedPostgres
 const conn_reset = ErrorException("tls read failed: unexpected TLS failure [SystemError: read: Connection reset by peer]")
 const conn_timeout = ErrorException("tls read failed: unexpected TLS failure [SystemError: read: Operation timed out]")
 const auth_failed = ErrorException("password authentication failed for user \"app\"")
-const stale_stmt = ErrorException("prepared statement does not exist")
+const stale_stmt = Postgres.API.Error("ERROR", "08P01",
+    "bind message supplies 1 parameters, but prepared statement \"s1\" requires 2", (nothing for _ = 1:14)...)
+
+# Rows whose own constructor throws errors that look like the driver's.
+struct RejectsRow
+    id::String
+    RejectsRow(id::String) = throw(ArgumentError("prepared statement does not exist"))
+end
+struct EmptyInsideRow
+    id::String
+    EmptyInsideRow(id::String) = (only(String[]); new(id))
+end
 
 # The driver reports a backend killed mid-query as the server's ErrorResponse.
 _pg_error(code, message) = Postgres.API.Error("FATAL", code, message, (nothing for _ = 1:14)...)
@@ -110,6 +121,9 @@ end
         decode_failure = TypeError(:typeassert, "", String, nothing)
         @test SP._should_retry(decode_failure, "SELECT * FROM users")
         @test !SP._should_retry(decode_failure, "INSERT INTO t VALUES (1) RETURNING *")
+        # Only the driver's own errors say a write never ran, not a message from other code.
+        @test !SP._should_retry(ArgumentError("prepared statement does not exist"), "INSERT INTO t VALUES (1)")
+        @test !SP._should_retry(ErrorException("bind message supplies 1 parameters"), "INSERT INTO t VALUES (1)")
         # Real query errors never retry.
         @test !SP._should_retry(ErrorException("duplicate key value"), "SELECT 1")
         @test !SP._should_retry(auth_failed, "SELECT 1")
@@ -156,6 +170,15 @@ end
         foreach(_ -> put!(release, nothing), 1:2)
         @test sum(fetch, held) + fetch(third) == 5
     end
+    # A read refused because no pool is set keeps none of the concurrent-read slots.
+    for _ in 1:2
+        @test_throws ErrorException SP.spawn_read(() -> 1, Int)
+    end
+    SP.with_db_pool("localhost", "user", "password", "database"; limit = 4) do
+        read = SP.spawn_read(() -> (sleep(0.05); 1), Int)
+        @test !istaskdone(read.task)
+        @test fetch(read) == 1
+    end
 end
 
 # The rest needs a PostgreSQL server: set PGHOST (and PGPORT, PGUSER, PGPASSWORD,
@@ -170,7 +193,7 @@ else
 
     @testset "against a database" begin
         with_test_pool(; limit = 4) do
-            SP.execute("DROP TABLE IF EXISTS scopedpostgres_items")
+            # Fails, instead of replacing it, when the database already has this table.
             SP.execute("""
                 CREATE TABLE scopedpostgres_items (
                     id TEXT PRIMARY KEY, name TEXT NOT NULL, size INT, added_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
@@ -216,12 +239,23 @@ else
 
             @testset "one row or none" begin
                 @test_throws ArgumentError SP.query(@NamedTuple{n::Int}, "SELECT n FROM generate_series(1, 2) n")
+                @test_throws ArgumentError SP.query(Any, "SELECT n FROM generate_series(1, 2) n")
                 err = try
                     SP.query(@NamedTuple{n::Int}, "SELECT n FROM scopedpostgres_missing")
                 catch e
                     e
                 end
                 @test SP.sqlstate(err) == "42P01"
+                # An error from the row's own constructor is not taken for "no rows".
+                @test_throws ArgumentError SP.query(EmptyInsideRow,
+                    "INSERT INTO scopedpostgres_items (id, name) VALUES ('s', 'Sierra') RETURNING id")
+            end
+
+            @testset "a write whose row fails to decode runs once" begin
+                @test_throws ArgumentError SP.query(RejectsRow,
+                    "INSERT INTO scopedpostgres_items (id, name) VALUES (md5(random()::text), 'Romeo') RETURNING id")
+                @test SP.query(@NamedTuple{n::Int},
+                    "SELECT count(*)::int AS n FROM scopedpostgres_items WHERE name = 'Romeo'").n == 1
             end
 
             @testset "a connection left inside a transaction is not lent out again" begin
@@ -306,6 +340,30 @@ else
                 end
                 # Outside a connection block, an inner pool is fine and uses its own connections.
                 @test with_test_pool(() -> SP.pool_stats().in_use) == 0
+            end
+        end
+
+        @testset "a transaction that can't begin on a held connection is not retried on it" begin
+            with_test_pool() do
+                pool = SP._get_db_pool()
+                err = SP.with_db_connection() do
+                    pid = SP.query(@NamedTuple{pid::Int}, "SELECT pg_backend_pid() AS pid").pid
+                    killer = SP._acquire_connection(pool; forcenew = true)
+                    try
+                        DBInterface.execute(killer, "SELECT pg_terminate_backend($pid)")
+                    finally
+                        SP._release_connection!(pool, killer)
+                    end
+                    sleep(0.5)
+                    try
+                        SP.transaction(() -> nothing)
+                        nothing
+                    catch e
+                        e
+                    end
+                end
+                # The caller sees the server's own reason, not a second try's "connection is closed".
+                @test SP.sqlstate(err) == "57P01"
             end
         end
 

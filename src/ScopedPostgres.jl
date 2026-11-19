@@ -516,17 +516,17 @@ function invalidate_schema!(dbname::AbstractString)
     invalidated = 0
     for pool in pools
         connections = PgConnection[]
-        active_count = 0
-        did_invalidate = _locked(pool) do
-            pool.draining[] && return false
+        # The count comes back as the block's value: a variable assigned inside the
+        # block would be boxed, which a trimmed program cannot compile.
+        active_count = _locked(pool) do
+            pool.draining[] && return -1
             pool.schema_generation += 1
             append!(connections, pool.idle)
             empty!(pool.idle)
             foreach(conn -> delete!(pool.connection_generations, conn), connections)
-            active_count = length(pool.active)
-            true
+            return length(pool.active)
         end
-        did_invalidate || continue
+        active_count < 0 && continue
         for conn in connections
             _close_connection!(conn)
         end
@@ -560,7 +560,8 @@ in_transaction() = IN_TRANSACTION[]
 
 Run `f()` inside one database transaction on one connection: it commits when `f` returns
 and rolls back when `f` throws. A nested `transaction` joins the outer one. If the
-connection fails before the transaction begins, it is retried once on a fresh connection.
+connection fails before the transaction begins, it is retried once on a fresh connection,
+unless it started inside `with_db_connection`, whose connection the retry would reuse.
 Statements inside a transaction are never retried. A task started inside the block
 inherits the transaction's connection: finish it before the block ends.
 `mock = true` runs `f()` without a transaction.
@@ -583,7 +584,8 @@ function transaction(f::F; mock::Bool=false) where {F}
             # means we drew a corrupted pooled connection (see _connection_ready).
             # with_db_connection already closed it; the whole transaction is safe
             # to retry exactly once on a guaranteed-fresh connection.
-            retryable = attempt == 1 && !begun[] &&
+            # A caller holding a connection would get the same broken one back.
+            retryable = attempt == 1 && !begun[] && !isassigned(DB_CONNECTION) &&
                 (_is_connection_error(e) || _is_stale_session_error(e))
             retryable || rethrow()
         end
@@ -592,14 +594,13 @@ function transaction(f::F; mock::Bool=false) where {F}
 end
 
 """
-Run a read projection against one repeatable PostgreSQL snapshot.
+    read_snapshot(f; mock = false)
 
-Public responses commonly assemble one logical document from several tables. A
-normal READ COMMITTED transaction can observe a regeneration between those
-queries and return a mixture of old and new schedule state. Keep the snapshot
-boundary explicit at the projection entry point; nested callers reuse an
-existing transaction because PostgreSQL isolation must be selected before its
-first statement.
+Run `f()` in one read-only, repeatable-read transaction, so every query in it sees the
+database as of the same moment: use it for a response built from several queries, which
+a write between them could otherwise leave half old and half new. Inside a
+[`transaction`](@ref), `f()` joins that transaction at its isolation level instead,
+because PostgreSQL sets the level before a transaction's first statement.
 """
 function read_snapshot(f; mock::Bool=false)
     (IN_TRANSACTION[] || mock) && return f()
@@ -636,7 +637,9 @@ one statement at a time), `f` finishes before `spawn_read` returns.
 """
 function spawn_read(f::F, ::Type{T}) where {F,T}
     if !isassigned(DB_CONNECTION)
-        if Threads.atomic_add!(_CONCURRENT_READS, 1) < pool_limit() ÷ 2
+        # Before taking a slot: outside a pool this throws, and the slot would never return.
+        limit = pool_limit()
+        if Threads.atomic_add!(_CONCURRENT_READS, 1) < limit ÷ 2
             return SpawnedRead{T}(@async try
                 f()
             finally
@@ -727,18 +730,21 @@ _is_connection_error_message(message::String) =
     occursin("read end of file", message) ||
     occursin("connection is closed", message)
 
-"Server/session-state desyncs where our statement provably didn't execute."
+"""
+Server/session-state desyncs where our statement provably didn't execute. Only the
+driver's own errors count: an exception thrown by other code, such as a row type's
+constructor, can carry the same words after a write ran.
+"""
 @noinline function _is_stale_session_error(@nospecialize(e))::Bool
-    message = _error_message(e)
-    cached_plan_shape_changed = e isa Postgres.API.Error && e.code == "0A000" &&
-        occursin("cached plan must not change result type", message)
+    e isa Postgres.API.Error || return false
+    message = e.message
+    # 0A000: a migration changed a cached statement's row shape.
     # 26000: the session no longer has the prepared statement.
-    statement_missing = e isa Postgres.API.Error && e.code == "26000"
-    return cached_plan_shape_changed || statement_missing ||
+    return (e.code == "0A000" && occursin("cached plan must not change result type", message)) ||
+           e.code == "26000" ||
            occursin("unexpected message type: E", message) ||
            occursin("bind message supplies", message) ||
-           occursin("prepared statement does not exist", message) ||
-           occursin("number of parameters provided", message)
+           occursin("prepared statement does not exist", message)
 end
 
 # Row decoding failed while consuming results — the statement already ran on
@@ -1300,22 +1306,14 @@ end
 
 function _query_once(::Type{T}, sql::String, params=nothing; forcenew::Bool=false) where {T}
     _count_query!()
-    with_db_connection(; forcenew) do
-        try
-            return execute_prepared(_get_db_connection(), sql, params, T)
-        catch e
-            # isa-narrow before occursin: ArgumentError.msg is declared
-            # AbstractString, and an abstract-typed occursin is a dynamic
-            # call under --trim (ours is always a String literal)
-            if e isa ArgumentError
-                m = e.msg
-                if m isa String && occursin("Collection is empty", m)
-                    return nothing
-                end
-            end
-            rethrow()
-        end
+    # Count the decoded rows, rather than reading "no rows" from an error, which a row
+    # type's own constructor could also throw.
+    rows = with_db_connection(; forcenew) do
+        return execute_prepared(_get_db_connection(), sql, params, Vector{T})
     end
+    length(rows) > 1 && throw(ArgumentError(
+        "query returned $(length(rows)) rows; use queryall for more than one"))
+    return isempty(rows) ? nothing : rows[1]
 end
 
 """
@@ -1327,6 +1325,7 @@ row as a `T`, or return `nothing` when there are no rows. More than one row thro
 are the parameters. `nothing` and `missing` parameters are SQL NULL.
 """
 function query(::Type{T}, sql::String, @nospecialize(params=nothing)) where {T}
+    T === Any && throw(ArgumentError("query needs a row type; use execute when you don't need the rows"))
     params = _normalize_params(params)
     try
         return _query_once(T, sql, params)

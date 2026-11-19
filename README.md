@@ -10,8 +10,8 @@ it, and give it back. No connection object is passed around.
 - Typed rows: ask for a `NamedTuple` (or any struct Postgres.jl can decode into).
 - Transactions on one connection, nested ones joining the outer one, and repeatable-read
   snapshots for reads that must agree with each other.
-- Safe retries: a statement that failed before it could have run (a dead pooled
-  connection, a lost prepared statement) is retried once on a fresh connection. A
+- Safe retries: a statement PostgreSQL never ran (it failed while being prepared, or the
+  server said the session had lost it) is retried once on a fresh connection. A
   statement starting with `SELECT` is also retried when the connection dies while it
   runs; a write is not, since it may already have committed. A `SELECT` with a side
   effect (`nextval`, a function that writes) counts as a read, so run it inside
@@ -60,6 +60,27 @@ Parameters are a tuple (up to 26 values) or a `Vector{Any}` of `String`, `Int`,
 A task started inside `with_db_connection` or `transaction` inherits its connection;
 finish it before the block ends. `spawn_read` inside one of those blocks runs its read
 before returning for this reason.
+
+## Limits
+
+- One connection runs one statement at a time. Tasks that share a connection (started
+  inside `with_db_connection` or `transaction`) must not run statements or transactions
+  at the same moment. Use `spawn_read` for reads that overlap.
+- A write is retried only on the driver's or server's word that it never ran: it failed
+  while being prepared, or PostgreSQL rejected it as a statement the session no longer has
+  (SQLSTATE 26000) or one whose row shape changed (0A000). A stored procedure that raises
+  one of those itself, after changing data, would run twice.
+- A connection the server closed while it sat idle is found when it is next used. If its
+  statement was already prepared on that connection, a write fails with the server's
+  error instead of being retried.
+- A session setting changed with `SET` stays on the connection for whoever uses it next.
+  Use `SET LOCAL` inside `transaction` instead.
+- A `DateTime` parameter is read in the session's time zone (`time_zone`, UTC by
+  default), while Postgres.jl decodes a `timestamptz` to UTC. With another `time_zone`,
+  pass instants as text with an offset.
+- `read_snapshot` inside a `transaction` runs in that transaction, at its isolation level.
+- After `invalidate_schema!`, and while a broken connection is closing, the pool can have
+  a few more than `limit` sessions open for a moment.
 
 ## Pool settings
 
