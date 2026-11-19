@@ -1,6 +1,7 @@
 # Compiled with `juliac` in CI to check that the pool, typed queries, transactions,
-# snapshots, concurrent reads, and the retry and error paths stay trim-safe, then run
-# against the CI database (PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE).
+# snapshots, concurrent reads, schema invalidation, and the retry and error paths stay
+# trim-safe, then run against the CI database (PGHOST, PGPORT, PGUSER, PGPASSWORD,
+# PGDATABASE).
 using ScopedPostgres
 
 const Item = @NamedTuple{id::String, name::String, size::Union{Int,Nothing}}
@@ -11,7 +12,7 @@ function check(name::String, ok::Bool)::Bool
 end
 
 function run_checks()::Bool
-    ScopedPostgres.execute("DROP TABLE IF EXISTS trim_items")
+    # Fails, instead of replacing it, when the database already has this table.
     ScopedPostgres.execute("CREATE TABLE trim_items (id TEXT PRIMARY KEY, name TEXT NOT NULL, size INT)")
     ScopedPostgres.execute("INSERT INTO trim_items VALUES (\$1, \$2, \$3)", ("a", "Alpha", 3))
     ScopedPostgres.execute("INSERT INTO trim_items VALUES (\$1, \$2, \$3)", ("b", "Bravo", nothing))
@@ -48,6 +49,9 @@ function run_checks()::Bool
         ScopedPostgres.query_count()
     end
     ok &= check("query counter", count == 1)
+    retired = ScopedPostgres.invalidate_schema!(get(ENV, "PGDATABASE", "postgres"))
+    ok &= check("invalidate_schema!", retired.pools == 1 &&
+        ScopedPostgres.query(@NamedTuple{n::Int}, "SELECT 1 AS n") == (n = 1,))
     ScopedPostgres.execute("DROP TABLE trim_items")
     return ok
 end
