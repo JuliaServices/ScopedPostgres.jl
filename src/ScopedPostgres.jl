@@ -633,7 +633,10 @@ A concurrent read checks out its own pool connections, one at a time. At most
 half the pool's limit of reads run concurrently, so they never take the
 connections that requests running their queries in turn need. Past that limit,
 and inside a transaction or a `with_db_connection` block (whose connection runs
-one statement at a time), `f` finishes before `spawn_read` returns.
+one statement at a time), `f` finishes before `spawn_read` returns; `fetch` still
+returns its result or throws its exception. One exception: inside a transaction,
+`spawn_read` itself throws a database error from `f`, because PostgreSQL rejects
+the rest of the transaction after one.
 """
 function spawn_read(f::F, ::Type{T}) where {F,T}
     if !isassigned(DB_CONNECTION)
@@ -649,7 +652,13 @@ function spawn_read(f::F, ::Type{T}) where {F,T}
         Threads.atomic_sub!(_CONCURRENT_READS, 1)
     end
     read = SpawnedRead{T}(@async f())
-    fetch(read)
+    wait(read.task; throw = false)
+    # After a database error PostgreSQL rejects every later statement of the transaction,
+    # so report this error now rather than let the caller's next statement fail in its place.
+    if IN_TRANSACTION[] && istaskfailed(read.task)
+        e = read.task.exception
+        sqlstate(e) === nothing || throw(e)
+    end
     return read
 end
 
