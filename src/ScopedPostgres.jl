@@ -633,7 +633,8 @@ A concurrent read checks out its own pool connections, one at a time. At most
 half the pool's limit of reads run concurrently, so they never take the
 connections that requests running their queries in turn need. Past that limit,
 and inside a transaction or a `with_db_connection` block (whose connection runs
-one statement at a time), `f` finishes before `spawn_read` returns.
+one statement at a time), `f` finishes before `spawn_read` returns; `fetch` still
+returns its result or throws its exception.
 """
 function spawn_read(f::F, ::Type{T}) where {F,T}
     if !isassigned(DB_CONNECTION)
@@ -649,7 +650,7 @@ function spawn_read(f::F, ::Type{T}) where {F,T}
         Threads.atomic_sub!(_CONCURRENT_READS, 1)
     end
     read = SpawnedRead{T}(@async f())
-    fetch(read)
+    wait(read.task; throw = false)
     return read
 end
 

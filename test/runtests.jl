@@ -167,6 +167,10 @@ end
         third = SP.spawn_read(() -> 3, Int)
         @test istaskdone(third.task)
         @test !any(read -> istaskdone(read.task), held)
+        # A read that runs before spawn_read returns still throws from fetch, not from spawn_read.
+        failed = SP.spawn_read(() -> throw(ArgumentError("bad id")), Int)
+        @test istaskdone(failed.task)
+        @test_throws ArgumentError("bad id") fetch(failed)
         foreach(_ -> put!(release, nothing), 1:2)
         @test sum(fetch, held) + fetch(third) == 5
     end
