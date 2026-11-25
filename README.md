@@ -52,7 +52,7 @@ ScopedPostgres.with_db_pool("localhost", "app", ENV["PGPASSWORD"], "appdb"; limi
 end
 ```
 
-Parameters are a tuple (up to 26 values) or a `Vector{Any}` of `String`, `Int`,
+Parameters are a tuple or a `Vector{Any}` of `String`, `Int`,
 `Int32`, `Float64`, `Bool`, `Date`, `DateTime`, bytes (`Vector{UInt8}`), `Vector`s of
 `String`, `Int`, or `Float64`, and `nothing` or `missing` for NULL. Other types throw an
 `ArgumentError`.
