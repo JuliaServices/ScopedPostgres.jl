@@ -37,7 +37,7 @@ const stale_row_shape = _pg_error("0A000", "cached plan must not change result t
     @test SP._normalize_params(Any["a", 1]) == ["a", "1"]
     @test SP._normalize_params(()) == Union{String,Missing}[]
     @test_throws ArgumentError SP._normalize_params((:symbol,))
-    @test_throws ArgumentError SP._normalize_params(ntuple(identity, 27))
+    @test SP._normalize_params(ntuple(identity, 40)) == string.(1:40)
 end
 
 @testset "pool settings" begin
