@@ -239,6 +239,25 @@ else
                 end
                 @test SP.sqlstate(err) == "23505"
                 @test SP.constraint_name(err) == "scopedpostgres_items_pkey"
+                # A read's database error inside a transaction is the error the transaction
+                # throws, not the "transaction is aborted" error of the statement after it.
+                N = Union{Nothing,@NamedTuple{n::Int}}
+                err = try
+                    SP.transaction() do
+                        read = SP.spawn_read(() -> SP.query(@NamedTuple{n::Int}, "SELECT 'x'::int AS n"), N)
+                        SP.query(@NamedTuple{n::Int}, "SELECT 1 AS n")
+                        fetch(read)
+                    end
+                catch e
+                    e
+                end
+                @test SP.sqlstate(err) == "22P02"
+                # Other errors still wait for fetch.
+                SP.transaction() do
+                    read = SP.spawn_read(() -> throw(ArgumentError("bad id")), Int)
+                    @test SP.query(@NamedTuple{n::Int}, "SELECT 1 AS n").n == 1
+                    @test_throws ArgumentError("bad id") fetch(read)
+                end
             end
 
             @testset "one row or none" begin
